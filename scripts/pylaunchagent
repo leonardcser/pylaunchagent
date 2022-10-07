@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from string import Template
+from typing import Union
+
+import yaml
+
+PLIST = Template(
+    """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+        <string>${LAUNCH_AGENT_NAME}</string>${CONFIG}
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>${RUN_PATH}</string>
+        <string>${DEST_DIR}</string>
+    </array>
+</dict>
+</plist>
+"""  # noqa: E501
+)
+
+
+def get_cmd_output(cmd: str, cmd_grep: str) -> None:
+    ps = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
+    out = subprocess.check_output(cmd_grep.split(), stdin=ps.stdout)
+    ps.wait()
+    print(out.decode("unicode_escape"), end="")
+
+
+def run_cmd(cmd: str) -> None:
+    print(f" + {cmd}")
+    p = subprocess.Popen(
+        cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    for line in p.stdout:
+        print(line.decode("unicode_escape"), end="")
+    p.wait()
+
+
+def run_shell_script(path: str, args: str = "") -> None:
+    run_cmd(f"sh {path} {args}".strip())
+
+
+@dataclass
+class PlistOpt:
+    indent_lvl: int
+    key: str
+
+    def _str_bool(self, b: bool) -> str:
+        return str(b).lower()
+
+    def get_value(self, enabled) -> str:
+        return (
+            "\n"
+            + (self.indent_lvl * "\t")
+            + f"<key>{self.key}</key>\n"
+            + ((self.indent_lvl + 1) * "\t")
+            + f"<{self._str_bool(enabled)}/>"
+        )
+
+
+class PlistOpts:
+    MAPPING: dict[str, PlistOpt] = {
+        "keep_alive": PlistOpt(indent_lvl=1, key="KeepAlive"),
+        "run_at_load": PlistOpt(indent_lvl=1, key="RunAtLoad"),
+    }
+
+    @staticmethod
+    def parse(opts_dict: dict[str, bool]) -> list[PlistOpt]:
+        res = []
+        for k, v in opts_dict.items():
+            if opt := PlistOpts.MAPPING.get(k):
+                res.append(opt.get_value(v))
+            else:
+                pass  # TODO: Raise Error
+        return "".join(res)
+
+
+@dataclass
+class InstallConfig:
+    entrypoint: Union[str, Path] = "./main.py"
+
+    requirements: str = "./requirements.txt"
+    modules: Union[str, list[str], list[Path]] = None
+    files: Union[str, list[str], list[Path]] = None
+    logs_filename: Union[str, Path] = None
+    launch_agent_plist: Union[str, Path] = None
+    options: Union[dict, str] = None
+
+    project_name: str = None
+    tag: str = "startup"
+
+    CONFIG_PATH = Path("./pylaunchagent.yaml")
+
+    def __post_init__(self) -> None:
+        if self.project_name is None:
+            self.project_name = Path.cwd().name
+
+        self.entrypoint = Path(self.entrypoint)
+        self.requirements = Path(self.requirements)
+        self.modules = self._parse_list(self.modules) if self.modules else []
+        self.files = self._parse_list(self.files) if self.files else []
+        self.logs_filename = self._parse_optional_path(self.logs_filename)
+        self.launch_agent_plist = self._parse_optional_path(
+            self.launch_agent_plist
+        )
+        if self.options:
+            self.options = PlistOpts.parse(self.options)
+        else:
+            self.options = PlistOpts.parse(
+                {"keep_alive": True, "run_at_load": True}
+            )
+
+    def _parse_optional_path(self, path: str) -> Union[Path, None]:
+        return Path(path) if path else None
+
+    def _parse_list(self, _list: Union[str, list[str]]) -> list[str]:
+        if isinstance(_list, list):
+            return [Path(m) for m in _list]
+        else:
+            return _list.split(",")
+
+    @staticmethod
+    def _find_config() -> Union["InstallConfig", None]:
+        if InstallConfig.CONFIG_PATH.exists():
+            with open(InstallConfig.CONFIG_PATH, "r") as f:
+                config = yaml.safe_load(f)
+                return InstallConfig(**config)
+        return None
+
+    @staticmethod
+    def load(args: argparse.Namespace) -> "InstallConfig":
+        return InstallConfig._find_config() or InstallConfig(*args)
+
+
+@dataclass
+class LaunchAgentManager:
+    config: InstallConfig
+
+    INSTALL_VENV_FILE_NAME = "pylaunchagent_install_venv"
+    RUN_FILE_NAME = "pylaunchagent_run"
+
+    LA_DIR = Path.home() / "Library/LaunchAgents"
+
+    def __post_init__(self) -> None:
+        self.dot_dir = Path.home() / ".pylaunchagent"
+        self.dest_dir = self.dot_dir / self.config.project_name
+
+        self.la_name = (
+            f"pylaunchagent.{self.config.tag}.{self.config.project_name}"
+        )
+        self.la_filename = f"{self.la_name}.plist"
+        self.la_path = self.LA_DIR / self.la_filename
+
+    def install(self) -> None:
+        print("-> Uninstalling old files...")
+        self.uninstall()
+
+        print("-> Copying files...")
+        os.makedirs(self.dest_dir)
+
+        shutil.copyfile(
+            self.config.entrypoint.absolute(), self.dest_dir / "entrypoint.py"
+        )
+        shutil.copyfile(
+            self.config.requirements.absolute(),
+            self.dest_dir / "requirements.txt",
+        )
+
+        for m in self.config.modules:
+            shutil.copytree(m, self.dest_dir / m)
+
+        for f in self.config.files:
+            shutil.copyfile(f, self.dest_dir / f.name)
+
+        # Installing run script
+        shutil.copyfile(
+            shutil.which(self.RUN_FILE_NAME),
+            self.dest_dir / self.RUN_FILE_NAME,
+        )
+
+        print(f"-> Creating LaunchAgent ({self.la_path})...")
+        if self.config.launch_agent_plist:
+            plist = self.config.launch_agent_plist.read_text()
+        else:
+            plist = PLIST.substitute(
+                LAUNCH_AGENT_NAME=self.la_name,
+                CONFIG=self.config.options,
+                RUN_PATH=self.dest_dir / self.RUN_FILE_NAME,
+                DEST_DIR=self.dest_dir,
+            )
+
+        with open(self.la_path, "w") as f:
+            f.write(plist)
+
+        print("-> Installing python environment...")
+        run_shell_script(
+            shutil.which(self.INSTALL_VENV_FILE_NAME), args=self.dest_dir
+        )
+
+        print("-> Running launch agent...")
+        run_cmd(f"launchctl load {self.la_path}")
+
+        print("Done!")
+
+    def uninstall(self) -> None:
+        if self.dest_dir.exists():
+            shutil.rmtree(self.dest_dir)
+        if self.dot_dir.is_dir() and len(os.listdir(self.dot_dir)) == 0:
+            os.rmdir(self.dot_dir)
+        if os.path.exists(self.la_path):
+            run_cmd(f"launchctl unload {self.la_path}")
+            os.remove(self.la_path)
+
+
+def _install(args: argparse.Namespace) -> None:
+    LaunchAgentManager(config=InstallConfig.load(args)).install()
+
+
+def _uninstall(args: argparse.Namespace = None) -> None:
+    LaunchAgentManager(config=InstallConfig.load(args)).uninstall()
+
+
+def status(args: argparse.Namespace = None) -> None:
+    lam = LaunchAgentManager(config=InstallConfig.load(args))
+    get_cmd_output("launchctl list", f"grep {lam.la_name}")
+
+
+def logs(args: argparse.Namespace = None) -> None:
+    lam = LaunchAgentManager(config=InstallConfig.load(args))
+    run_cmd(f"tail -f {lam.dest_dir / lam.config.logs_filename}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser("PyLaunchAgent")
+    parser.add_argument(
+        "-n",
+        "--name",
+        type=str,
+        dest="project_name",
+        help=(
+            "The name of the project."
+            "By default it will use the current directory name"
+        ),
+    )
+    parser.add_argument(
+        "-t",
+        "--tag",
+        type=str,
+        dest="tag",
+        help="An optional tag for the LaunchAgent name",
+    )
+
+    subparsers = parser.add_subparsers(help="Sub-commands help")
+
+    install_parser = subparsers.add_parser(
+        "install", help="Install Python code to macos LaunchAgents"
+    )
+    install_parser.add_argument(
+        "-e",
+        "--entrypoint",
+        type=str,
+        dest="entrypoint",
+        help="The path to the entrypoint that should be executed",
+    )
+    install_parser.add_argument(
+        "-r",
+        "--requirements",
+        type=str,
+        dest="requirements",
+        help="The path to the python requirements",
+    )
+    install_parser.add_argument(
+        "-m",
+        "--modules",
+        type=str,
+        dest="modules",
+        help="A list separted by ',' of dependency modules for the entrypoint",
+    )
+    install_parser.add_argument(
+        "-f",
+        "--files",
+        type=str,
+        dest="files",
+        help="A list separted by ',' of dependency files for the entrypoint",
+    )
+    install_parser.add_argument(
+        "-l",
+        "--logs",
+        type=str,
+        dest="logs_filename",
+        help="The path to a log file",
+    )
+    install_parser.add_argument(
+        "-p",
+        "--plist",
+        type=str,
+        dest="launch_agent_plist",
+        help="The path a custom plist file.",
+    )
+    install_parser.set_defaults(func=_install)
+    uninstall_parser = subparsers.add_parser(
+        "uninstall", help="Uninstall from LaunchAgents"
+    )
+    uninstall_parser.set_defaults(func=_uninstall)
+
+    status_parser = subparsers.add_parser(
+        "status", help="Get the status from LaunchAgents"
+    )
+    status_parser.set_defaults(func=status)
+    logs_parser = subparsers.add_parser(
+        "logs", help="Get the logs from the scheduler"
+    )
+    logs_parser.set_defaults(func=logs)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

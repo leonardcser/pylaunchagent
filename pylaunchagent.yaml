@@ -1,0 +1,11 @@
+entrypoint: "main.py"
+requirements: "./requriements/dev-requirements.txt"
+# modules:
+# files:
+# logs_filename:
+# launch_agent_plist: ""
+options:
+    keep_alive: true
+    run_at_load: true
+# project_name: "" # By default current folder name
+# tag: ""
