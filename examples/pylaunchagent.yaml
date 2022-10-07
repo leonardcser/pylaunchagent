@@ -1,13 +1,12 @@
 entrypoint: "main.py"
-requirements: "./requriements/dev-requirements.txt"
+requirements: "./requirements/requirements.txt"
 modules:
     - "folder1"
     - "folder2"
 files:
     - "env_file.env"
     - "data_file.json"
-logs_filename:
-    - "logs.log"
+logs_filename: "logs.log"
 launch_agent_plist: "path_to_plist" # not recommended, docs is missing
 options:
     keep_alive: true
